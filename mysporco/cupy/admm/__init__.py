@@ -1,0 +1,146 @@
+# -*- coding: utf-8 -*-
+# Copyright (C) 2018-2019 by Brendt Wohlberg <brendt@ieee.org>
+# All rights reserved. BSD 3-clause License.
+# This file is part of the SPORCO package. Details of the copyright
+# and user license can be found in the 'LICENSE.txt' file distributed
+# with the package.
+
+"""Construct variant of admm subpackage that use cupy instead of numpy"""
+
+from __future__ import absolute_import
+
+import sys
+import re
+
+from mysporco.cupy import sporco_cupy_patch_module
+from mysporco.cupy import cp
+from mysporco.cupy import util
+from mysporco.cupy import common
+from mysporco.cupy import linalg
+from mysporco.cupy import prox
+from mysporco.cupy import cnvrep
+
+
+# Construct mysporco.cupy.admm
+admm = sporco_cupy_patch_module('mysporco.admm')
+
+# Construct mysporco.cupy.admm.admm
+admm.admm = sporco_cupy_patch_module('mysporco.admm.admm',
+                                     {'util': util, 'common': common})
+
+
+def _update_rho(self, k, r, s):
+    """
+    Patched version of :func:`sporco.admm.admm.ADMM.update_rho`."""
+
+    if self.opt['AutoRho', 'Enabled']:
+        tau = self.rho_tau
+        mu = self.rho_mu
+        xi = self.rho_xi
+        if k != 0 and cp.mod(k + 1, self.opt['AutoRho', 'Period']) == 0:
+            if self.opt['AutoRho', 'AutoScaling']:
+                if s == 0.0 or r == 0.0:
+                    rhomlt = tau
+                else:
+                    rhomlt = cp.sqrt(r / (s * xi) if r > s * xi
+                                     else (s * xi) / r)
+                    if rhomlt > tau:
+                        rhomlt = tau
+            else:
+                rhomlt = tau
+            rsf = 1.0
+            if r > xi * mu * s:
+                rsf = rhomlt
+            elif s > (mu / xi) * r:
+                rsf = 1.0 / rhomlt
+            self.rho *= float(rsf)
+            self.U /= rsf
+            if rsf != 1.0:
+                self.rhochange()
+
+
+admm.admm.ADMM.update_rho = _update_rho
+
+
+def _cnst0(self):
+    return cp.array(0.0, dtype=self.dtype)
+
+
+admm.admm.ADMMTwoBlockCnstrnt.cnst_c0 = _cnst0
+admm.admm.ADMMTwoBlockCnstrnt.cnst_c1 = _cnst0
+
+
+# Record current entries in sys.modules and then replace them with
+# patched versions of the modules
+sysmod = {}
+for mod in ('mysporco.common', 'mysporco.admm', 'mysporco.admm.admm'):
+    if mod in sys.modules:
+        sysmod[mod] = sys.modules[mod]
+sys.modules['mysporco.common'] = common
+sys.modules['mysporco.admm'] = admm
+sys.modules['mysporco.admm.admm'] = admm.admm
+
+
+# Construct sporco.cupy.admm.tvl1
+admm.tvl1 = sporco_cupy_patch_module('mysporco.admm.tvl1',
+                                     {'admm': admm.admm, 'sl': linalg,
+                                      'sp': prox})
+
+# Construct sporco.cupy.admm.tvl2
+admm.tvl2 = sporco_cupy_patch_module('mysporco.admm.tvl2',
+                                     {'admm': admm.admm, 'sl': linalg,
+                                      'sp': prox})
+
+# Construct sporco.cupy.admm.bpdn
+admm.bpdn = sporco_cupy_patch_module('mysporco.admm.bpdn',
+                                     {'admm': admm.admm, 'sl': linalg,
+                                      'sp': prox})
+
+# Construct mysporco.cupy.admm.cbpdn
+admm.cbpdn = sporco_cupy_patch_module('mysporco.admm.cbpdn',
+                                      {'admm': admm.admm, 'cr': cnvrep,
+                                       'sl': linalg, 'sp': prox})
+
+
+def _index_primary(self):
+    return (Ellipsis, slice(0, -self.cri.Cd, None))
+
+
+def _index_addmsk(self):
+    return (Ellipsis, slice(-self.cri.Cd, None, None))
+
+
+admm.cbpdn.AddMaskSim.index_primary = _index_primary
+admm.cbpdn.AddMaskSim.index_addmsk = _index_addmsk
+
+
+# Construct sporco.cupy.admm.cbpdntv
+admm.cbpdntv = sporco_cupy_patch_module('mysporco.admm.cbpdntv',
+                                        {'admm': admm.admm, 'cr': cnvrep,
+                                         'cbpdn': admm.cbpdn, 'sl': linalg,
+                                         'sp': prox})
+
+admm.cbpdntv.ConvBPDNScalarTV.cnst_c = _cnst0
+admm.cbpdntv.ConvBPDNRecTV.cnst_c = _cnst0
+
+
+# Construct sporco.cupy.admm.pdcsc
+admm.pdcsc = sporco_cupy_patch_module('mysporco.admm.pdcsc',
+                                      {'admm': admm.admm, 'cr': cnvrep,
+                                       'cbpdn': admm.cbpdn, 'sl': linalg,
+                                       'sp': prox})
+
+
+# Restore original entries in sys.modules
+for mod in ('mysporco.common', 'mysporco.admm', 'mysporco.admm.admm'):
+    if mod in sysmod:
+        sys.modules[mod] = sysmod[mod]
+    else:
+        del sys.modules[mod]
+
+
+# In sporco.cupy.admm module, replace original module source path with
+# corresponding path in 'sporco/cupy' directory tree
+for n, pth in enumerate(sys.modules['mysporco.cupy.admm'].__path__):
+    pth = re.sub('mysporco/', 'mysporco/cupy/', pth)
+    sys.modules['mysporco.cupy.admm'].__path__[n] = pth
